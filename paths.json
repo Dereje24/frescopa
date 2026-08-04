@@ -5,6 +5,8 @@
     "/content/frescopa/metadata:/metadata.json",
     "/content/frescopa/en/placeholders:/placeholders.json",
     "/content/frescopa/en/locations/locationslist:/locations.json",
+    "/content/frescopa/en:/en",
+    "/content/frescopa/en/:/en/",
     "/content/frescopa/es:/es",
     "/content/frescopa/es/:/es/",
     "/content/frescopa/es/placeholders:/placeholders.json",

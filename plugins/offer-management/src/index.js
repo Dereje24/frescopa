@@ -221,7 +221,10 @@ export async function startOfferManagement(main, config = {}, host = {}) {
       await Promise.all(slots.map((slot) => processSlot(slot, decision, ctx)));
     } finally {
       slots.forEach((slot) => {
-        if (slot.result.state === 'pending') settle(slot, 'failed', 'internal-error');
+        if (slot.result.state === 'pending') {
+          warn(slot.mbox, 'internal-error');
+          settle(slot, 'failed', 'internal-error');
+        }
         reveal(slot.element);
       });
     }

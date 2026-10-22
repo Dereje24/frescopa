@@ -25,6 +25,38 @@ import {
   showExperimentationRail,
 } from './experiment-loader.js';
 
+// Offer Management (SITES-54509): applies Adobe Target JSON offers to the page's personalized blocks.
+// Runs on published Edge Delivery hosts only, never in the Universal Editor author frame.
+const OFFER_MANAGEMENT = {
+  hosts: /(^|\.)aem\.(live|page)$|^localhost$/,
+  // Test datastream (Sites Internal org → Target tenant sitesinternal).
+  webSDK: {
+    datastreamId: 'd3abdd59-2bee-4cb4-a7c9-c9a8de5ddc0c',
+    orgId: '908936ED5D35CC220A495CD4@AdobeOrg',
+    defaultConsent: 'pending',
+    clickCollectionEnabled: false,
+  },
+  consent: { collect: true, personalize: true, share: false },
+  fragmentOrigins: ['https://main--frescopa--dereje24.aem.live', 'https://main--frescopa--dereje24.aem.page'],
+};
+
+function startOfferManagementIfEnabled(main) {
+  if (!OFFER_MANAGEMENT.hosts.test(window.location.hostname)) return Promise.resolve();
+  return import('../plugins/offer-management/src/index.js')
+    .then(({ startOfferManagement }) => startOfferManagement(main, {
+      fragmentOrigins: OFFER_MANAGEMENT.fragmentOrigins,
+      loadSdk: async () => {
+        const martech = await import('../plugins/martech/src/index.js');
+        await martech.initMartech(OFFER_MANAGEMENT.webSDK, {
+          personalization: true, analytics: false, dataLayer: false, trackPageView: false,
+        });
+        await martech.updateUserConsent(OFFER_MANAGEMENT.consent);
+        return martech;
+      },
+    }, { decorate: decorateMain, loadSections }))
+    .catch(() => {});
+}
+
 const experimentationConfig = {
   prodHost: 'frescopa.coffee', // TODO: change domains for different showcases.
   audiences: {
@@ -325,10 +357,13 @@ async function loadEager(doc) {
     // Template Decorations
     await applyTemplates(doc);
 
+    // Offer Management: prehides only the personalized blocks; the first section waits for them.
+    const offerManagement = startOfferManagementIfEnabled(main);
+
     // Load LCP blocks
     await loadSection(main.querySelector('.section'), (section) => {
       if (document.body.classList.contains('quick-edit')) return Promise.resolve();
-      return waitForFirstImage(section);
+      return Promise.all([waitForFirstImage(section), offerManagement]);
     });
     document.body.classList.add('appear');
   }

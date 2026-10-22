@@ -1,6 +1,7 @@
 // Slot discovery and identity. A slot is the default block an Offer Management activity
-// personalizes; its identity is the recorded `omMbox` (`offer-mgmt-<8 hex>`), carried on the
-// published block either as a class token or as `data-om-mbox`.
+// personalizes; its identity is the recorded `omMbox` (`offer-mgmt-<8 hex>`). `createvariant`
+// stamps it as a class token on the default block; `normalizeSlots` turns that stamp into the
+// canonical `data-om-mbox` attribute (consuming the token), like a block option class.
 import { MBOX_PATTERN } from './offers.js';
 
 export const SLOT_ATTR = 'data-om-mbox';
@@ -26,14 +27,49 @@ export function readIdentity(element) {
 
 export const isInvalidIdentity = (value) => value === INVALID;
 
+const candidates = (root) => [
+  ...(root.matches?.(CANDIDATES) ? [root] : []), ...root.querySelectorAll(CANDIDATES),
+];
+
 /**
- * Default resolver: every element in `main` carrying an mbox class token or `data-om-mbox`.
- * Elements with malformed or conflicting identity are returned with `mbox: null` so discovery
- * can refuse them.
+ * Normalizes stamped slots in `root`: a valid mbox class token becomes the canonical
+ * `data-om-mbox` attribute and the token is removed. Elements whose identity inputs are
+ * malformed or conflict are left as authored (discovery refuses them). Idempotent; safe to call
+ * from the site's `decorateMain` so the attribute exists before blocks load.
+ * @param {Element} root
+ * @returns {Element} root
+ */
+export function normalizeSlots(root) {
+  if (!root?.querySelectorAll) return root;
+  candidates(root).forEach((element) => {
+    const identity = readIdentity(element);
+    if (typeof identity !== 'string') return;
+    [...element.classList].filter((token) => MBOX_PATTERN.test(token))
+      .forEach((token) => element.classList.remove(token));
+    if (element.getAttribute('class') === '') element.removeAttribute('class');
+    element.setAttribute(SLOT_ATTR, identity);
+  });
+  return root;
+}
+
+/**
+ * Whether `element` is or contains a slot (stamped or normalized). Lets a site hold a section's
+ * first paint for the runtime only when that section actually has a slot.
+ */
+export function hasSlots(element) {
+  if (!element?.querySelectorAll) return false;
+  return candidates(element).some((candidate) => typeof readIdentity(candidate) === 'string');
+}
+
+/**
+ * Default resolver: normalizes stamped slots (see `normalizeSlots`), then returns every element
+ * in `main` carrying an mbox. Elements with malformed or conflicting identity are returned with
+ * `mbox: null` so discovery can refuse them.
  * @param {Element} main
  * @returns {Array<{element: Element, mbox: string|null}>}
  */
 export function defaultResolveSlots(main) {
+  normalizeSlots(main);
   return [...main.querySelectorAll(CANDIDATES)]
     .map((element) => ({ element, identity: readIdentity(element) }))
     .filter(({ identity }) => identity !== null)
@@ -90,9 +126,8 @@ export function discoverSlots(main, resolve, refuse) {
   });
 }
 
-/** Puts the slot identity (class token + attribute) on an element. */
+/** Puts the canonical slot identity (`data-om-mbox`) on an element. */
 export function stampIdentity(element, mbox) {
-  element.classList.add(mbox);
   element.setAttribute(SLOT_ATTR, mbox);
 }
 

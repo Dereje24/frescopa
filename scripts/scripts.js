@@ -40,21 +40,21 @@ const OFFER_MANAGEMENT = {
   fragmentOrigins: ['https://main--frescopa--dereje24.aem.live', 'https://main--frescopa--dereje24.aem.page'],
 };
 
-function startOfferManagementIfEnabled(main) {
-  if (!OFFER_MANAGEMENT.hosts.test(window.location.hostname)) return Promise.resolve();
-  return import('../plugins/offer-management/src/index.js')
-    .then(({ startOfferManagement }) => startOfferManagement(main, {
-      fragmentOrigins: OFFER_MANAGEMENT.fragmentOrigins,
-      loadSdk: async () => {
-        const martech = await import('../plugins/martech/src/index.js');
-        await martech.initMartech(OFFER_MANAGEMENT.webSDK, {
-          personalization: true, analytics: false, dataLayer: false, trackPageView: false,
-        });
-        await martech.updateUserConsent(OFFER_MANAGEMENT.consent);
-        return martech;
-      },
-    }, { decorate: decorateMain, loadSections }))
-    .catch(() => {});
+async function startOfferManagementIfEnabled(main) {
+  if (!OFFER_MANAGEMENT.hosts.test(window.location.hostname)) return { ready: Promise.resolve(), hasSlots: () => false };
+  const om = await import('../plugins/offer-management/src/index.js');
+  const ready = Promise.resolve(om.startOfferManagement(main, {
+    fragmentOrigins: OFFER_MANAGEMENT.fragmentOrigins,
+    loadSdk: async () => {
+      const martech = await import('../plugins/martech/src/index.js');
+      await martech.initMartech(OFFER_MANAGEMENT.webSDK, {
+        personalization: true, analytics: false, dataLayer: false, trackPageView: false,
+      });
+      await martech.updateUserConsent(OFFER_MANAGEMENT.consent);
+      return martech;
+    },
+  }, { decorate: decorateMain, loadSections })).catch(() => {});
+  return { ready, hasSlots: om.hasSlots };
 }
 
 const experimentationConfig = {
@@ -357,13 +357,15 @@ async function loadEager(doc) {
     // Template Decorations
     await applyTemplates(doc);
 
-    // Offer Management: prehides only the personalized blocks; the first section waits for them.
-    const offerManagement = startOfferManagementIfEnabled(main);
+    // Offer Management: prehides only the personalized blocks (one 1 s budget); the first section
+    // waits only when it contains one.
+    const offerManagement = await startOfferManagementIfEnabled(main).catch(() => null);
 
     // Load LCP blocks
     await loadSection(main.querySelector('.section'), (section) => {
       if (document.body.classList.contains('quick-edit')) return Promise.resolve();
-      return Promise.all([waitForFirstImage(section), offerManagement]);
+      const hold = offerManagement?.hasSlots(section) ? offerManagement.ready : null;
+      return Promise.all([waitForFirstImage(section), hold]);
     });
     document.body.classList.add('appear');
   }

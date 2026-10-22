@@ -13,12 +13,13 @@ import {
 import { requestDecisions } from './decisions.js';
 
 export { parseOffer, selectOffer, MBOX_PATTERN } from './offers.js';
-export { defaultResolveSlots, readIdentity } from './slots.js';
+export {
+  defaultResolveSlots, readIdentity, normalizeSlots, hasSlots,
+} from './slots.js';
 export { resolveFragmentUrl, parseFragment } from './render.js';
 export { createSdkAdapter } from './decisions.js';
 
 export const DEFAULT_TIMEOUT_MS = 1000;
-export const DEFAULT_RENDER_TIMEOUT_MS = 1000;
 const LOG_PREFIX = '[offer-management]';
 
 function withTimeout(promise, ms, onTimeout) {
@@ -104,11 +105,11 @@ async function processSlot(slot, decision, ctx) {
         doc: ctx.doc, baseURL: fetchURL, mediaOrigins: ctx.mediaOrigins, sanitize: ctx.host.sanitize,
       });
       return buildFragment(content, ctx.host, ctx.doc);
-    })(), ctx.renderTimeout, () => {
+    })(), ctx.remaining(), () => {
       expired = true;
       controller.abort();
     });
-    if (expired) throw fail('timeout');
+    if (expired || ctx.remaining() <= 0) throw fail('timeout');
     if (!element.isConnected || !ctx.main.contains(element)
         || element.getAttribute(STATE_ATTR) !== 'pending') {
       throw fail('slot-changed');
@@ -127,9 +128,10 @@ async function processSlot(slot, decision, ctx) {
 /**
  * Applies Offer Management JSON offers to the slots in `main`.
  *
- * Await the returned promise before the first section is shown (the anti-flicker "hold"): it
- * settles once every slot is rendered or has kept its default, bounded by `timeout` (decision)
- * plus `renderTimeout` (fragment render). It never rejects.
+ * Await the returned promise before showing a section that contains a slot (the anti-flicker
+ * "hold", see `hasSlots`): it settles once every slot is rendered or has kept its default, within
+ * ONE budget, `timeout`, shared by the decision and every slot's fetch + render. Nothing is
+ * swapped in after it. It never rejects.
  *
  * @param {Element} main the page's decorated `<main>`
  * @param {object} [config]
@@ -139,8 +141,9 @@ async function processSlot(slot, decision, ctx) {
  * @param {boolean} [config.rebaseToPageOrigin=true] fetch the validated fragment path from the page's
  *   own origin (offer URLs name the site's aem.live origin, which sends no CORS headers)
  * @param {string[]} [config.mediaOrigins] allowed media origins (default: fragment + page origins)
- * @param {number} [config.timeout=1000] decision budget in ms
- * @param {number} [config.renderTimeout=1000] per-slot fetch + render budget in ms
+ * @param {number} [config.timeout=1000] total budget in ms from the call (SDK load, decision,
+ *   fragment fetch + render for every slot); on expiry pending slots keep their default
+ * @param {number} [config.renderTimeout] deprecated and ignored: `timeout` covers rendering
  * @param {number} [config.maxFragmentBytes=1048576]
  * @param {Function} [config.resolveSlots] `(main) => Array<{element, mbox}>`
  * @param {string} [config.pageURL] page URL for the decision request (aem-martech only)
@@ -156,6 +159,7 @@ async function processSlot(slot, decision, ctx) {
  * @returns {Promise<{slots: Array<{mbox: string, state: string, reason?: string}>}>}
  */
 export async function startOfferManagement(main, config = {}, host = {}) {
+  const started = Date.now();
   const result = { slots: [] };
   const options = config && typeof config === 'object' ? config : {};
   const logger = typeof options.logger?.warn === 'function' ? options.logger : console;
@@ -185,6 +189,8 @@ export async function startOfferManagement(main, config = {}, host = {}) {
     if (!slots.length) return result;
 
     const budget = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback);
+    const deadline = started + budget(options.timeout, DEFAULT_TIMEOUT_MS);
+    const remaining = () => Math.max(0, deadline - Date.now());
     const pageOrigin = win.location?.origin;
     const fragmentOrigins = normalizeOrigins(options.fragmentOrigins ?? [pageOrigin]);
     const ctx = {
@@ -196,7 +202,7 @@ export async function startOfferManagement(main, config = {}, host = {}) {
       fragmentOrigins,
       fetchOrigin: options.rebaseToPageOrigin === false ? null : pageOrigin,
       mediaOrigins: normalizeOrigins(options.mediaOrigins ?? [...fragmentOrigins, pageOrigin]),
-      renderTimeout: budget(options.renderTimeout, DEFAULT_RENDER_TIMEOUT_MS),
+      remaining,
       maxBytes: budget(options.maxFragmentBytes, MAX_FRAGMENT_BYTES),
       fetch: host.fetch || (typeof win.fetch === 'function' ? win.fetch.bind(win) : globalThis.fetch),
     };
@@ -210,7 +216,7 @@ export async function startOfferManagement(main, config = {}, host = {}) {
       try {
         decision = await withTimeout(
           requestDecisions(options, slots.map(({ mbox }) => mbox)),
-          budget(options.timeout, DEFAULT_TIMEOUT_MS),
+          remaining(),
         );
       } catch (e) {
         const reason = e?.reason === 'timeout' ? 'decision-timeout' : (e?.reason || 'decision-failed');

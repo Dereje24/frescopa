@@ -20,16 +20,19 @@ export { resolveFragmentUrl, parseFragment } from './render.js';
 export { createSdkAdapter } from './decisions.js';
 
 export const DEFAULT_TIMEOUT_MS = 1000;
+export const DEFAULT_LATE_TIMEOUT_MS = 5000;
+export const TIMEOUT_META = 'personalization-timeout';
+const MAX_META_TIMEOUT_MS = 10000;
 const LOG_PREFIX = '[offer-management]';
 
-function withTimeout(promise, ms, onTimeout) {
+function withTimeout(promise, ms, onTimeout, reason = 'timeout') {
   let timer;
   const deadline = new Promise((resolve, reject) => {
     timer = setTimeout(() => {
       try {
         onTimeout?.();
       } finally {
-        reject(fail('timeout'));
+        reject(fail(reason));
       }
     }, ms);
   });
@@ -100,7 +103,7 @@ async function processSlot(slot, decision, ctx) {
       const html = await fetchFragment(fetchURL, {
         fetch: ctx.fetch, signal: controller.signal, maxBytes: ctx.maxBytes,
       });
-      if (expired) throw fail('timeout');
+      if (expired) throw fail(ctx.expiredReason);
       const content = parseFragment(html, {
         doc: ctx.doc, baseURL: fetchURL, mediaOrigins: ctx.mediaOrigins, sanitize: ctx.host.sanitize,
       });
@@ -108,8 +111,8 @@ async function processSlot(slot, decision, ctx) {
     })(), ctx.remaining(), () => {
       expired = true;
       controller.abort();
-    });
-    if (expired || ctx.remaining() <= 0) throw fail('timeout');
+    }, ctx.expiredReason);
+    if (expired || ctx.remaining() <= 0) throw fail(ctx.expiredReason);
     if (!element.isConnected || !ctx.main.contains(element)
         || element.getAttribute(STATE_ATTR) !== 'pending') {
       throw fail('slot-changed');
@@ -119,19 +122,39 @@ async function processSlot(slot, decision, ctx) {
     settle(slot, 'rendered');
     report(inserted);
   } catch (e) {
-    const reason = e?.reason || 'render-failed';
+    const reason = expired ? ctx.expiredReason : (e?.reason || 'render-failed');
     ctx.warn(mbox, reason);
     settle(slot, 'failed', reason);
   }
 }
 
+// Per-page first-section budget from EDS page metadata ("Personalization Timeout"): an integer
+// number of ms in [0, 10000]; anything else is ignored with one static warning.
+function readMetaTimeout(doc, warn) {
+  const meta = doc.querySelector?.(`meta[name="${TIMEOUT_META}"]`);
+  if (!meta) return undefined;
+  const raw = (meta.getAttribute('content') ?? '').trim();
+  const value = /^\d{1,5}$/.test(raw) ? Number(raw) : NaN;
+  if (value >= 0 && value <= MAX_META_TIMEOUT_MS) return value;
+  warn(null, 'invalid-timeout');
+  return undefined;
+}
+
 /**
- * Applies Offer Management JSON offers to the slots in `main`.
+ * Applies Offer Management JSON offers to the slots in `main`, in two groups:
  *
- * Await the returned promise before showing a section that contains a slot (the anti-flicker
- * "hold", see `hasSlots`): it settles once every slot is rendered or has kept its default, within
- * ONE budget, `timeout`, shared by the decision and every slot's fetch + render. Nothing is
- * swapped in after it. It never rejects.
+ * - **First section** (the first `.section` of `main`, the one the site holds for LCP, see
+ *   `hasSlots`): decision + fetch + render bounded by `timeout` (default 1000 ms from the call,
+ *   overridable per page with `<meta name="personalization-timeout" content="<ms>">`). On
+ *   expiry they keep their default (`timeout` / `decision-timeout`); nothing is swapped in later.
+ * - **Later sections**: not bound by `timeout`. Processed once the decision arrives, attempted
+ *   once and kept hidden until settled, with a safety cap `lateTimeout` (default 5000 ms from the
+ *   call) after which an unsettled slot keeps its default (`late-timeout`).
+ *
+ * The returned promise resolves once the first-section slots have settled — await it before
+ * showing the first section when `hasSlots(firstSection)` — with `{ slots, done }`: `slots` is the
+ * live list of every slot's result (later ones may still be `pending`) and `done` resolves with
+ * `{ slots }` once every slot has settled. Neither ever rejects.
  *
  * @param {Element} main the page's decorated `<main>`
  * @param {object} [config]
@@ -141,9 +164,12 @@ async function processSlot(slot, decision, ctx) {
  * @param {boolean} [config.rebaseToPageOrigin=true] fetch the validated fragment path from the page's
  *   own origin (offer URLs name the site's aem.live origin, which sends no CORS headers)
  * @param {string[]} [config.mediaOrigins] allowed media origins (default: fragment + page origins)
- * @param {number} [config.timeout=1000] total budget in ms from the call (SDK load, decision,
- *   fragment fetch + render for every slot); on expiry pending slots keep their default
- * @param {number} [config.renderTimeout] deprecated and ignored: `timeout` covers rendering
+ * @param {number} [config.timeout=1000] first-section budget in ms from the call (SDK load,
+ *   decision, fragment fetch + render of the first section's slots); the page's
+ *   `personalization-timeout` meta, when valid, takes precedence
+ * @param {number} [config.lateTimeout=5000] safety cap in ms from the call for slots in later
+ *   sections (never less than the first-section budget)
+ * @param {number} [config.renderTimeout] deprecated and ignored
  * @param {number} [config.maxFragmentBytes=1048576]
  * @param {Function} [config.resolveSlots] `(main) => Array<{element, mbox}>`
  * @param {string} [config.pageURL] page URL for the decision request (aem-martech only)
@@ -156,11 +182,16 @@ async function processSlot(slot, decision, ctx) {
  * @param {Function} [host.loadBlock] `(block) => Promise` — alternative loader
  * @param {Function} [host.sanitize] `(html) => string`, e.g. DOMPurify.sanitize (runs first)
  * @param {Function} [host.fetch] fetch implementation (default: window.fetch)
- * @returns {Promise<{slots: Array<{mbox: string, state: string, reason?: string}>}>}
+ * @returns {Promise<{
+ *   slots: Array<{mbox: string, state: string, reason?: string}>,
+ *   done: Promise<{slots: Array<{mbox: string, state: string, reason?: string}>}>
+ * }>}
  */
 export async function startOfferManagement(main, config = {}, host = {}) {
   const started = Date.now();
-  const result = { slots: [] };
+  const slotResults = [];
+  const result = { slots: slotResults };
+  let all = Promise.resolve();
   const options = config && typeof config === 'object' ? config : {};
   const logger = typeof options.logger?.warn === 'function' ? options.logger : console;
   // Static reason codes and slot mboxes only: never offer content, URLs, identities or markup.
@@ -171,7 +202,6 @@ export async function startOfferManagement(main, config = {}, host = {}) {
       // logging must never break the page
     }
   };
-  let slots = [];
   try {
     if (!main || main.nodeType !== 1 || options.enabled === false) return result;
     if (!validHost(host)) {
@@ -182,15 +212,15 @@ export async function startOfferManagement(main, config = {}, host = {}) {
     const win = doc.defaultView || globalThis;
     const resolve = typeof options.resolveSlots === 'function'
       ? options.resolveSlots : defaultResolveSlots;
-    slots = discoverSlots(main, resolve, warn).map((slot) => ({
+    const slots = discoverSlots(main, resolve, warn).map((slot) => ({
       ...slot, result: { mbox: slot.mbox, state: 'pending' },
     }));
-    result.slots = slots.map((slot) => slot.result);
+    slotResults.push(...slots.map((slot) => slot.result));
     if (!slots.length) return result;
 
     const budget = (value, fallback) => (Number.isFinite(value) && value >= 0 ? value : fallback);
-    const deadline = started + budget(options.timeout, DEFAULT_TIMEOUT_MS);
-    const remaining = () => Math.max(0, deadline - Date.now());
+    const timeoutMs = readMetaTimeout(doc, warn) ?? budget(options.timeout, DEFAULT_TIMEOUT_MS);
+    const lateMs = Math.max(timeoutMs, budget(options.lateTimeout, DEFAULT_LATE_TIMEOUT_MS));
     const pageOrigin = win.location?.origin;
     const fragmentOrigins = normalizeOrigins(options.fragmentOrigins ?? [pageOrigin]);
     const ctx = {
@@ -202,40 +232,62 @@ export async function startOfferManagement(main, config = {}, host = {}) {
       fragmentOrigins,
       fetchOrigin: options.rebaseToPageOrigin === false ? null : pageOrigin,
       mediaOrigins: normalizeOrigins(options.mediaOrigins ?? [...fragmentOrigins, pageOrigin]),
-      remaining,
       maxBytes: budget(options.maxFragmentBytes, MAX_FRAGMENT_BYTES),
       fetch: host.fetch || (typeof win.fetch === 'function' ? win.fetch.bind(win) : globalThis.fetch),
     };
 
-    slots.forEach(({ element }) => {
-      element.setAttribute(STATE_ATTR, 'pending');
-      prehide(element);
-    });
-    try {
-      let decision;
+    // One decision request for every slot; with Target all decisions come back in that call.
+    const outcome = Promise.resolve()
+      .then(() => requestDecisions(options, slots.map(({ mbox }) => mbox)))
+      .then((decision) => ({ decision }), (e) => ({ reason: e?.reason || 'decision-failed' }));
+    const logged = new Set();
+    const warnOnce = (reason) => {
+      if (logged.has(reason)) return;
+      logged.add(reason);
+      warn(null, reason);
+    };
+
+    const runGroup = async (group, ms, expiredReason) => {
+      if (!group.length) return;
+      const deadline = started + ms;
+      const remaining = () => Math.max(0, deadline - Date.now());
       try {
-        decision = await withTimeout(
-          requestDecisions(options, slots.map(({ mbox }) => mbox)),
-          remaining(),
-        );
-      } catch (e) {
-        const reason = e?.reason === 'timeout' ? 'decision-timeout' : (e?.reason || 'decision-failed');
-        warn(null, reason);
-        slots.forEach((slot) => settle(slot, 'failed', reason));
-        return result;
-      }
-      await Promise.all(slots.map((slot) => processSlot(slot, decision, ctx)));
-    } finally {
-      slots.forEach((slot) => {
-        if (slot.result.state === 'pending') {
-          warn(slot.mbox, 'internal-error');
-          settle(slot, 'failed', 'internal-error');
+        group.forEach(({ element }) => {
+          element.setAttribute(STATE_ATTR, 'pending');
+          prehide(element);
+        });
+        const decided = await withTimeout(outcome, remaining()).catch(() => ({
+          reason: expiredReason === 'timeout' ? 'decision-timeout' : expiredReason,
+        }));
+        if (decided.reason) {
+          warnOnce(decided.reason);
+          group.forEach((slot) => settle(slot, 'failed', decided.reason));
+          return;
         }
-        reveal(slot.element);
-      });
-    }
+        const groupCtx = { ...ctx, remaining, expiredReason };
+        await Promise.all(group.map((slot) => processSlot(slot, decided.decision, groupCtx)));
+      } finally {
+        group.forEach((slot) => {
+          if (slot.result.state === 'pending') {
+            warn(slot.mbox, 'internal-error');
+            settle(slot, 'failed', 'internal-error');
+          }
+          reveal(slot.element);
+        });
+      }
+    };
+    const guard = (promise) => promise.catch(() => warn(null, 'internal-error'));
+
+    const firstSection = main.querySelector('.section') || main.firstElementChild;
+    const isFirst = (slot) => !!firstSection?.contains(slot.element);
+    const early = guard(runGroup(slots.filter(isFirst), timeoutMs, 'timeout'));
+    const late = guard(runGroup(slots.filter((slot) => !isFirst(slot)), lateMs, 'late-timeout'));
+    all = Promise.all([early, late]);
+    await early;
   } catch {
     warn(null, 'internal-error');
+  } finally {
+    result.done = all.then(() => ({ slots: slotResults }), () => ({ slots: slotResults }));
   }
   return result;
 }
